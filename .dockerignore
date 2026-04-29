@@ -1,0 +1,22 @@
+# Git
+.git
+.gitignore
+
+# Modelos
+*.h5
+
+*.nii
+*.nii.gz
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+venv/
+.venv/
+
+.env
+
+Dockerfile
+.dockerignore
