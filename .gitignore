@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.h5
+*.nii
+*.nii.gz
+.env
+venv/
+.venv/
