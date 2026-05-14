@@ -1,8 +1,11 @@
 # Git
 .git
 .gitignore
+.agents
+.codex
 
 # Modelos
+models/
 *.h5
 
 *.nii

@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 # Importa o motor de inferência
 from engine import run_pipeline
+from model_loader import ensure_models
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -64,8 +65,8 @@ logger = logging.getLogger("alzheimer-api")
 # ─────────────────────���───────────────────────────────────────────────────────
 # Caminhos dos modelos
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_ROI_PATH = os.getenv("MODEL_ROI_PATH", "modelo_cnn1_08_maio.h5")
-MODEL_CLF_PATH = os.getenv("MODEL_CLF_PATH", "CNN-4-2023-1.h5")
+MODEL_ROI_PATH = os.getenv("MODEL_ROI_PATH", "models/modelo_cnn1_08_maio.h5")
+MODEL_CLF_PATH = os.getenv("MODEL_CLF_PATH", "models/CNN-4-2023-1.h5")
 
 # Dicionário global — preenchido no startup
 MODELS: dict = {}
@@ -217,6 +218,8 @@ async def lifespan(app: FastAPI):
     
     Os modelos ficam disponíveis durante toda a vida da aplicação.
     """
+    ensure_models(MODEL_ROI_PATH, MODEL_CLF_PATH)
+
     logger.info("Carregando modelo de ROI: %s", MODEL_ROI_PATH)
     try:
         MODELS["roi"] = tf.keras.models.load_model(MODEL_ROI_PATH)
