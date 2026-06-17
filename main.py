@@ -5,7 +5,7 @@ API FastAPI de inferência médica para classificação de Alzheimer via MRI.
 
 Endpoints:
   GET  /healthz                    — Liveness probe
-  POST /v1/predict/alzheimer       — Classificação com metadados completos
+  POST /v1/predict/alzheimer?       — Classificação com metadados completos
 
 Uso:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
@@ -46,8 +46,10 @@ from typing import List
 import tensorflow as tf
 from tensorflow_addons.metrics import F1Score
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+import asyncio
+from fastapi import FastAPI, File, HTTPException, UploadFile, status, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from functools import partial
 
 # Importa o motor de inferência
 from engine import run_pipeline
@@ -263,10 +265,45 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ──────────────────────────────────────────────────────────────────────
+# Gerenciador de conexões WebSocket para progresso
+# ──────────────────────────────────────────────────────────────────────
+
+class ConnectionManager:
+    def __init__(self):
+        self.active: dict[str, WebSocket] = {}
+
+    async def connect(self, job_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active[job_id] = websocket
+
+    def disconnect(self, job_id: str):
+        self.active.pop(job_id, None)
+
+    async def send_progress(self, job_id: str, data: dict):
+        ws = self.active.get(job_id)
+        if ws:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                self.disconnect(job_id)
+
+manager = ConnectionManager()
+
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Endpoints
 # ═════════════════════════════════════════════════════════════════════════════
+@app.websocket("/ws/progress/{job_id}")
+async def websocket_progress(websocket: WebSocket, job_id: str):
+    await manager.connect(job_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # só mantém viva a conexão
+    except WebSocketDisconnect:
+        manager.disconnect(job_id)
+
 
 @app.get("/healthz", tags=["infra"])
 async def health():
@@ -286,6 +323,7 @@ async def health():
     summary="Classifica MRI cerebral — Paridade Total com Script Base",
 )
 async def predict(
+    job_id: str | None = None,          
     file: UploadFile = File(
         ...,
         description="Arquivo NIfTI (.nii ou .nii.gz)"
@@ -336,9 +374,22 @@ async def predict(
 
         logger.info("Arquivo recebido: %s (%d bytes) → temp: %s",
                     fname, len(content), tmp_path)
+        
 
         # Executa pipeline (retorna TODOS os metadados)
-        result = run_pipeline(tmp_path, MODELS["roi"], MODELS["clf"])
+        loop = asyncio.get_running_loop()
+        def progress_callback(percent: float, message: str):
+            if job_id:
+                asyncio.run_coroutine_threadsafe(
+                    manager.send_progress(job_id, {"progress": round(percent, 2), "status": message}),
+                    loop,
+                )
+
+        pipeline_fn = partial(
+            run_pipeline, tmp_path, MODELS["roi"], MODELS["clf"],
+            progress_callback=progress_callback,
+        )
+        result = await loop.run_in_executor(None, pipeline_fn)
 
         logger.info("Pipeline concluído: %s (prob_media=%.4f, CV=%.4f)",
                     result["diagnostico"],

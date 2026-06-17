@@ -14,7 +14,7 @@ Arquitetura headless — ZERO bibliotecas visuais.
 """
 
 import logging
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Callable, Optional
 import numpy as np
 import cv2
 import nibabel as nib
@@ -153,7 +153,9 @@ def prepare_for_clf_model(raw_slice: np.ndarray,
 # BLOCO 2 — Pipeline de inferência (com captura completa de metadados)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_hippocampus_roi(img_data: np.ndarray, model_roi) -> Dict[str, Any]:
+def scan_hippocampus_roi(img_data: np.ndarray, 
+                         model_roi, 
+                         progress_callback: Optional[Callable[[float, str], None]] = None,) -> Dict[str, Any]:
     """Varre todos os cortes coronais para localizar o hipocampo.
 
     Para cada corte, alimenta o modelo_cnn1 e coleta o score de ROI.
@@ -162,6 +164,7 @@ def scan_hippocampus_roi(img_data: np.ndarray, model_roi) -> Dict[str, Any]:
     Args:
         img_data: Array 3D do NIfTI (SafeImage).
         model_roi: Modelo Keras para detecção de ROI.
+        progress_callback: Função de callback para atualizar o progresso da varredura.
 
     Returns:
         Dict com:
@@ -177,6 +180,10 @@ def scan_hippocampus_roi(img_data: np.ndarray, model_roi) -> Dict[str, Any]:
     for ii in range(n_coronal):
         inp = prepare_for_roi_model(img_data[:, ii, :])
         scores[ii] = float(model_roi.predict(inp, verbose=0)[0][0])
+
+        if progress_callback:
+            progress = (ii + 1) / n_coronal * 100
+            progress_callback(progress, f"Varredura ROI: {ii + 1}/{n_coronal} cortes")
 
     logger.debug("ROI scores calculados: min=%.4f, max=%.4f, mean=%.4f",
                  scores.min(), scores.max(), scores.mean())
@@ -204,7 +211,7 @@ def scan_hippocampus_roi(img_data: np.ndarray, model_roi) -> Dict[str, Any]:
         if len(interval) == 0:
             break
 
-    sl_central = int(round((lim_inf + lim_sup) / 2))
+    sl_central = int(round((lim_inf + lim_sup) / 2)) #valor sl_central de cada varredura
 
     logger.info("ROI detectada: [%d, %d] → slice_central=%d (threshold=%.4f)",
                 lim_inf, lim_sup, sl_central, threshold)
@@ -260,7 +267,10 @@ def build_roi_dataset(img_data: np.ndarray, sl_central: int) -> Tuple[List, int,
     return dataset, ini_cranio, int_max
 
 
-def classify_alzheimer(dataset: List[np.ndarray], model_clf) -> Dict[str, Any]:
+def classify_alzheimer(dataset: List[np.ndarray], 
+                       model_clf,
+                       progress_callback: Optional[Callable[[float, str], None]] = None,
+                       ) -> Dict[str, Any]:
     """Classifica cada slice do dataset e agrega o resultado com estatísticas.
 
     Retorna:
@@ -274,17 +284,22 @@ def classify_alzheimer(dataset: List[np.ndarray], model_clf) -> Dict[str, Any]:
     Args:
         dataset: List[np.ndarray] — 19 slices uint8.
         model_clf: Modelo Keras classificador.
-
+        progress_callback: Função de callback para atualizar o progresso da classificação.
     Returns:
         Dict com todos os parâmetros acima.
     """
     predicoes = []
+    total = len(dataset)
 
-    for img_u8 in dataset:
+    for idx,img_u8 in enumerate(dataset):
         rgb = np.stack([img_u8, img_u8, img_u8], axis=-1).astype(np.float32) / 255.0
         inp = rgb.reshape(1, *rgb.shape)
         pred = model_clf.predict(inp, verbose=0)  # shape (1, 2)
         predicoes.append(float(pred[0][0]))
+
+        if progress_callback:
+            progress = 50 + (idx + 1) / total * 50
+            progress_callback(progress, f"Classificando slice: {idx + 1}/{total}")
 
     predicoes_array = np.array(predicoes)
     media = float(np.mean(predicoes_array))
@@ -338,7 +353,11 @@ def _classificar_cv(valor: float) -> str:
         return "High variability"
 
 
-def run_pipeline(nifti_path: str, model_roi, model_clf) -> Dict[str, Any]:
+def run_pipeline(nifti_path: str, 
+                 model_roi, 
+                 model_clf,
+                 progress_callback: Optional[Callable[[float, str], None]] = None,
+                 ) -> Dict[str, Any]:
     """Orquestra o pipeline completo com extração de TODOS os metadados.
 
     Passos:
@@ -351,6 +370,7 @@ def run_pipeline(nifti_path: str, model_roi, model_clf) -> Dict[str, Any]:
         nifti_path: Caminho do arquivo NIfTI temporário.
         model_roi: Modelo Keras para ROI.
         model_clf: Modelo Keras para classificação.
+        progress_callback: Função de callback para atualizar o progresso geral.
 
     Returns:
         Dict contendo TODOS os dados necessários para frontend:
@@ -362,7 +382,8 @@ def run_pipeline(nifti_path: str, model_roi, model_clf) -> Dict[str, Any]:
           - metadados_extracao_cnn2 (inicio_cranio_y)
     """
     logger.info("Iniciando pipeline para: %s", nifti_path)
-
+    if progress_callback:
+        progress_callback(0, "Carregando NIfTI")
     # ──────────────────────────────────────────────────────────────────────
     # Passo 1: Carrega NIfTI e extrai metadados
     # ──────────────────────────────────────────────────────────────────────
@@ -380,7 +401,7 @@ def run_pipeline(nifti_path: str, model_roi, model_clf) -> Dict[str, Any]:
     # ──────────────────────────────────────────────────────────────────────
     # Passo 2: Varre ROI (retorna scores e limites)
     # ──────────────────────────────────────────────────────────────────────
-    roi_result = scan_hippocampus_roi(img_data, model_roi)
+    roi_result = scan_hippocampus_roi(img_data, model_roi, progress_callback)
 
     # ──────────────────────────────────────────────────────────────────────
     # Passo 3: Monta dataset de 19 slices (retorna ini_cranio)
@@ -395,7 +416,10 @@ def run_pipeline(nifti_path: str, model_roi, model_clf) -> Dict[str, Any]:
     # ──────────────────────────────────────────────────────────────────────
     # Passo 4: Classifica com estatísticas
     # ──────────────────────────────────────────────────────────────────────
-    clf_result = classify_alzheimer(dataset, model_clf)
+    clf_result = classify_alzheimer(dataset, model_clf, progress_callback)
+
+    if progress_callback:
+        progress_callback(100, "Concluído")
 
     # ──────────────────────────────────────────────────────────────────────
     # Retorna resultado COMPLETO com TODOS os metadados
