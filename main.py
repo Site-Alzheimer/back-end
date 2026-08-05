@@ -48,6 +48,7 @@ from tensorflow_addons.metrics import F1Score
 
 import asyncio
 from fastapi import FastAPI, File, HTTPException, UploadFile, status, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from functools import partial
 
@@ -264,6 +265,15 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Gerenciador de conexões WebSocket para progresso
