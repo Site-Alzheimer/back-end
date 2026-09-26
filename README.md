@@ -460,6 +460,64 @@ file
 }
 ```
 
+## Campos novos, progresso e scripts
+
+Todas as mudanças são aditivas e **não alteram o que as redes calculam**: os campos antigos da
+resposta continuam iguais, e os novos só aparecem quando existem. O `scripts/paridade.py`
+confere isso contra respostas gravadas antes das mudanças.
+
+### Parâmetros de `POST /v1/predict/alzheimer`
+
+| Parâmetro | Padrão | Efeito |
+|---|---|---|
+| `job_id` | — | Identificador do WebSocket de progresso (8 a 64 caracteres: letras, números e hífen) |
+| `visualizacao` | `true` | Inclui `imagens`: as 19 entradas da CNN2 (sprite WebP sem perda) e a entrada da CNN1 |
+| `explicacao` | `false` | Inclui `gradcam`: mapas Grad-CAM da CNN2 (última Conv2D, grade 5×5) |
+
+Campos novos na resposta:
+- `tempos_ms`, com o tempo de cada etapa;
+- em `metadados_varredura_cnn1`: `limiar`, `score_max`, `indice_max`, `fallback` e o `recorte` que a CNN1 recebe;
+- em `metadados_extracao_cnn2`: os `indices` reais das 19 fatias, `margem`, `int_max` e o `recorte`;
+- em `estatisticas_predicao`: `votos_alzheimer`, só informativo, porque a decisão continua sendo pela média;
+- em `metadados_nifti`: dimensões e espaçamento canônicos, orientação e tipo dos voxels.
+
+Um NIfTI inválido (arquivo corrompido, volume que não é 3D, dimensões fora do esperado) agora
+recebe **400**, com a mensagem, em vez de 500.
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `GRADCAM_CAMADA` | última Conv2D | Camada usada na Grad-CAM |
+| `AMOSTRAS_DIR` | `amostras` | Pasta dos exames de exemplo (veja `amostras/LEIAME.md`) |
+
+### Progresso pelo WebSocket
+
+Ao conectar em `/ws/progress/{job_id}`, o servidor envia `{"stage": "ready"}`. O cliente deve
+esperar essa mensagem antes de enviar o exame. Depois chegam as etapas `load`, `cnn1` (8 lotes,
+cada um com `start`, `done`, `total` e os `scores` calculados), `extract`, `cnn2` e `done`. O campo
+`progress` agora só cresce.
+
+### Exames de exemplo
+
+- `GET /v1/amostras` lista os exames;
+- `GET /v1/amostras/{id}/arquivo` e `/miniatura` servem o arquivo e a miniatura;
+- `POST /v1/predict/alzheimer/amostra/{id}` analisa sem upload, com a mesma resposta do predict.
+
+### Scripts (rodar dentro do container)
+
+```bash
+# Garante que o resultado continua idêntico às respostas gravadas antes das mudanças
+python scripts/paridade.py /data/AD_002_S_0619.nii /data/CN_002_S_0295.nii --referencia /out
+
+# Miniaturas do carrossel
+python scripts/gerar_miniaturas.py amostras
+```
+
+### Desempenho
+
+A CNN1 passou a avaliar as fatias em lotes de 32, em vez de uma por chamada, e os modelos são
+aquecidos no startup. As entradas das redes e o resultado são os mesmos; o tempo por exame
+(CPU) caiu de ~17,9 s para ~2,7 s.
+
 ## Problemas Comuns
 
 ### Erro ao carregar modelos
