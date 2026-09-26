@@ -9,3 +9,6 @@ venv/
 .codex
 .agents
 /models
+# Exames de exemplo servidos pela API (dados de pacientes: nunca versionar)
+/amostras/*
+!/amostras/LEIAME.md
