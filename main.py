@@ -363,10 +363,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Origens que podem chamar a API de outro site (lista separada por vírgula). Em produção o front
+# fica no mesmo domínio e a lista é só ele; sem a variável, qualquer origem (uso local e scripts).
+# Sem cookies nem login, então sem credenciais.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -528,7 +533,8 @@ async def predict(
     
     # Validação 1: Extensão
     if not (fname.endswith(".nii") or fname.endswith(".nii.gz")):
-        logger.warning("Arquivo rejeitado: extensão inválida (%s)", fname)
+        # O nome do arquivo pode identificar o paciente: o log guarda só a extensão
+        logger.warning("Arquivo rejeitado: extensão inválida (%s)", os.path.splitext(fname)[1] or "sem extensão")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Formato inválido. Envie um arquivo .nii ou .nii.gz.",
@@ -547,8 +553,7 @@ async def predict(
             content = await file.read()
             tmp.write(content)
 
-        logger.info("Arquivo recebido: %s (%d bytes) → temp: %s",
-                    fname, len(content), tmp_path)
+        logger.info("Arquivo recebido: %s, %d bytes", suffix, len(content))
 
         return await _analisar(tmp_path, job_id, visualizacao, explicacao)
 
