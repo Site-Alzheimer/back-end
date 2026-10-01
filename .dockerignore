@@ -23,3 +23,9 @@ venv/
 
 Dockerfile
 .dockerignore
+
+# Exames de exemplo, arquivos de implantação e CI não entram na imagem
+amostras/
+deploy/
+.github/
+Dockerfile.conda

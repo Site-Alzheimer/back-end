@@ -1,0 +1,9 @@
+[Unit]
+Description=NeuroIA: aplica as imagens novas publicadas pelo GitHub Actions
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/neuroia-atualizar
