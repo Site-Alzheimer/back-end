@@ -1,0 +1,42 @@
+# Produção na VM do IFCE: o site inteiro em https://neuroia.ifce.edu.br.
+# Na VM: /opt/neuroia/compose.yml é um link para este arquivo (no clone do repositório).
+# O nginx da VM (fora do Docker) faz o HTTPS e repassa para estes dois containers, que só
+# escutam em 127.0.0.1. As imagens são montadas pelo GitHub Actions e publicadas no GHCR.
+name: neuroia
+
+services:
+  api:
+    image: ghcr.io/site-alzheimer/back-end:main
+    restart: unless-stopped
+    environment:
+      MODEL_ROI_PATH: /models/modelo_cnn1_08_maio.h5
+      MODEL_CLF_PATH: /models/CNN-4-2023-1.h5
+      AMOSTRAS_DIR: /amostras
+      # Front no mesmo domínio: nenhum outro site chama a API pelo navegador
+      CORS_ORIGINS: https://neuroia.ifce.edu.br
+    volumes:
+      - /opt/neuroia/models:/models:ro
+      - /opt/neuroia/amostras:/amostras:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+    healthcheck:
+      test: ["CMD", "/opt/conda/bin/python", "-c", "import json, sys, urllib.request as u; sys.exit(0 if json.load(u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)).get('models_loaded') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3m
+
+  web:
+    image: ghcr.io/site-alzheimer/front-end:main
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
