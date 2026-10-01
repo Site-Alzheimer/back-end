@@ -1,0 +1,25 @@
+# API com o TensorFlow do conda-forge: compilado para x86-64 genérico, roda em CPU sem AVX
+# (VM do IFCE, Xeon X5675). O Dockerfile original (pip) continua para máquinas com AVX.
+FROM mambaorg/micromamba:1.5.10
+
+USER root
+WORKDIR /app
+
+# TensorFlow e numpy vêm do conda-forge; o numpy fica na mesma versão do requirements.txt
+RUN micromamba install -y -n base -c conda-forge \
+        python=3.10 "tensorflow=2.10.0=cpu*" numpy=1.21.6 \
+    && micromamba clean -a -y
+
+ARG MAMBA_DOCKERFILE_ACTIVATE=1
+
+# O resto sai do requirements.txt (UTF-16), sem as linhas que o conda já instalou
+COPY requirements.txt .
+RUN python -c "import io; linhas = io.open('requirements.txt', encoding='utf-16').read().splitlines(); \
+open('/tmp/req-pip.txt', 'w').write('\n'.join(l for l in linhas if not l.startswith(('tensorflow==', 'numpy=='))))" \
+    && pip install --no-cache-dir -r /tmp/req-pip.txt \
+    && python -c "import tensorflow as tf, numpy; print('TF', tf.__version__, 'numpy', numpy.__version__)"
+
+COPY . .
+
+EXPOSE 8000
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
