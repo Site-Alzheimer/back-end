@@ -82,9 +82,9 @@ passo "4/9 nginx e certbot"
 
 passo "5/9 nginx: porta 80 (Let's Encrypt e redirecionamento) e teste local em 127.0.0.1:8088"
 install -d -m 755 /var/www/letsencrypt
-if ! grep -Eqs '^\s*server_tokens' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf; then
-  echo "server_tokens off;  # não mostra a versão do nginx" > /etc/nginx/conf.d/neuroia-seguranca.conf
-fi
+# A versão do nginx fica escondida dentro dos nossos blocos server (server_tokens off). O Ubuntu já
+# traz "server_tokens build;" no nginx.conf; repetir a diretiva em conf.d daria "duplicate".
+rm -f /etc/nginx/conf.d/neuroia-seguranca.conf
 for f in neuroia-proxy.conf neuroia-rotas.conf; do
   copia "/etc/nginx/snippets/$f"
   install -m 644 "$DEPLOY/nginx/$f" "/etc/nginx/snippets/$f"
