@@ -79,7 +79,7 @@ logger = logging.getLogger("alzheimer-api")
 # ─────────────────────���───────────────────────────────────────────────────────
 # Caminhos dos modelos
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_ROI_PATH = os.getenv("MODEL_ROI_PATH", "models/modelo_cnn1_08_maio.h5")
+MODEL_ROI_PATH = os.getenv("MODEL_ROI_PATH", "models/modelo_cnn3_L20_3A5.h5")
 MODEL_CLF_PATH = os.getenv("MODEL_CLF_PATH", "models/CNN-4-2023-1.h5")
 
 # Dicionário global — preenchido no startup
@@ -146,6 +146,9 @@ class MetadadosNifti(BaseModel):
     dimensoes_canonicas: Optional[List[int]] = Field(None, description="Dimensões na orientação RAS", example=[166, 256, 256])
     espacamento_canonico: Optional[List[float]] = Field(None, description="Espaçamento na orientação RAS (mm)")
     orientacao_original: Optional[str] = Field(None, description="Códigos de eixo do arquivo (nibabel)", example="IPL")
+    orientacao_analise: Optional[str] = Field(
+        None, description="Orientação em que as redes recebem o volume; os índices das fatias são nela "
+                          "(IPL: 0 = anterior, como no notebook do Dr. Raimundo)", example="IPL")
     ornt: Optional[List[List[float]]] = Field(None, description="nib.io_orientation do arquivo")
     tipo_dado: Optional[str] = Field(None, description="Tipo dos voxels no arquivo", example=">f4")
 
@@ -170,14 +173,14 @@ class MetadadosVarreduraCNN1(BaseModel):
     limite_inferior: int = Field(
         ...,
         ge=0,
-        description="Índice do primeiro slice onde ROI >= 80% do máximo",
+        description="Índice do primeiro slice onde ROI > 80% do máximo (índice IPL, 0 = anterior)",
         example=143
     )
     
     limite_superior: int = Field(
         ...,
         ge=0,
-        description="Índice do último slice onde ROI >= 80% do máximo",
+        description="Índice do último slice onde ROI > 80% do máximo, depois da remoção de vales",
         example=147
     )
     
@@ -191,7 +194,7 @@ class MetadadosVarreduraCNN1(BaseModel):
     limiar: Optional[float] = Field(None, description="80% do score máximo")
     score_max: Optional[float] = None
     indice_max: Optional[int] = None
-    fallback: Optional[bool] = Field(None, description="True quando nenhum score atingiu o limiar (todos ≤ 0)")
+    fallback: Optional[bool] = Field(None, description="Sempre False: sem fatia acima do limiar, a API responde 400")
     recorte: Optional[Recorte] = None
 
 

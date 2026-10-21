@@ -12,9 +12,13 @@ Extrai TODOS os parâmetros necessários para reconstrução de gráficos no fro
 
 Arquitetura headless — ZERO bibliotecas visuais.
 
-Além dos resultados acima, devolve dados extras para o painel (tempos por etapa, recortes,
-as imagens que as redes receberam e Grad-CAM), sem alterar o que as redes calculam:
-scripts/paridade.py compara com as respostas gravadas antes dessas mudanças.
+O pré-processamento, a janela e a decisão seguem o notebook do Dr. Raimundo
+(Pipeline_Alzheimer.ipynb, 28/03/2026, células 6, 13, 16, 18 e 20). O volume é lido na orientação
+IPL, a dos exames do ADNI em que o notebook roda, e os índices das fatias são os do notebook
+(0 = anterior). scripts/paridade.py compara com respostas geradas rodando o próprio notebook.
+
+Além disso, devolve dados extras para o painel (tempos por etapa, recortes, as imagens que as
+redes receberam e Grad-CAM), sem alterar o que as redes calculam.
 """
 
 import base64
@@ -29,8 +33,12 @@ from nibabel import orientations
 
 logger = logging.getLogger("alzheimer-engine")
 
-# Offsets dos 19 slices ao redor do corte central do hipocampo
+# Offsets dos 19 slices ao redor do corte central do hipocampo (`desl` da célula 13).
+# No índice IPL, +9 é a fatia mais posterior.
 OFFSETS = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7, -8, -9]
+
+# Orientação em que as redes recebem o volume: a dos exames do ADNI, em que o notebook roda
+ORIENTACAO_ANALISE = ("I", "P", "L")
 
 # Tamanho fixo dos lotes da CNN1: o último lote é completado para não recompilar o grafo
 LOTE_CNN1 = 32
@@ -44,127 +52,88 @@ class ExameInvalido(ValueError):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BLOCO 1 — Funções auxiliares de pré-processamento
+# BLOCO 1 — Pré-processamento das fatias (notebook, células 6 e 13)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def robust_normalize(arr: np.ndarray, 
-                     pct_low: float = 2.0, 
-                     pct_high: float = 98.0) -> np.ndarray:
-    """Normaliza pelo percentil para suprimir pixels espúrios de ruído.
+def volume_ipl(img) -> np.ndarray:
+    """Dados do volume na orientação IPL, como o notebook os recebe de `img_ni.get_fdata()`.
 
-    Em vez de dividir pelo valor máximo (que pode ser um pixel isolado de ruído),
-    clipa os valores entre o 2º e o 98º percentil dos pixels não-nulos e então
-    reescala para [0, 1].
+    Nos exames do ADNI (já em IPL) é exatamente o `get_fdata()` do notebook. Arquivos em outra
+    orientação são reordenados para IPL, para as fatias chegarem às redes em pé, como no treino.
+    """
+    dados = img.get_fdata()
+    transf = orientations.ornt_transform(orientations.io_orientation(img.affine),
+                                         orientations.axcodes2ornt(ORIENTACAO_ANALISE))
+    if np.array_equal(transf, [[0, 1], [1, 1], [2, 1]]):
+        return dados
+    return orientations.apply_orientation(dados, transf)
 
-    Args:
-        arr: Array de intensidades (qualquer dimensão).
-        pct_low: Percentil inferior (padrão 2.0).
-        pct_high: Percentil superior (padrão 98.0).
+
+def prepare_for_roi_model(raw_slice: np.ndarray) -> np.ndarray:
+    """Pré-processa uma fatia coronal para a CNN1, como a célula 6 do notebook.
+
+    A fatia chega em pé (linhas de cima para baixo). Passos:
+      1. gira 180° e, se tiver menos de 176 colunas, redimensiona para 256 × 176;
+      2. divide pelo máximo da fatia e converte para 8 bits;
+      3. guarda as linhas 65 a 219 (k = 40): tira o pescoço e o topo do crânio;
+      4. redimensiona para 176 × 176 e desvira;
+      5. repete nos 3 canais e divide por 255.
 
     Returns:
-        Array normalizado em [0.0, 1.0], dtype float32.
+        Tensor (1, 176, 176, 3) float32 pronto para model.predict().
     """
-    nonzero = arr[arr > 0]
-    if nonzero.size == 0:
-        return arr.astype(np.float32)
-    
-    p_low, p_high = np.percentile(nonzero, [pct_low, pct_high])
-    clipped = np.clip(arr, p_low, p_high)
-    span = p_high - p_low + 1e-8
-    
-    return ((clipped - p_low) / span).astype(np.float32)
+    img_salva = cv2.rotate(raw_slice, cv2.ROTATE_180)
+    if raw_slice.shape[1] < 176:
+        img_salva = cv2.resize(img_salva, (176, 256))
+    img2 = img_salva
+    if img2.max() != 0:
+        img2 = img2 / img2.max()
+    img2 = 255 * img2
+    img2 = img2.astype(np.uint8)
+    k = 40  # início do crânio fixo
+    img_corta2 = img2[100 - k + 5:255 - k + 5, :]
+    img_salva = cv2.resize(img_corta2, (176, 176))
+    img_salva = cv2.rotate(img_salva, cv2.ROTATE_180)
 
-
-def find_skull_start(img_uint8: np.ndarray) -> int:
-    """Detecta a primeira linha vertical com sinal cerebral relevante.
-
-    Percorre a imagem de cima para baixo em blocos de largura proporcional.
-    Retorna o índice de linha (0-based) onde o crânio começa.
-
-    Args:
-        img_uint8: Imagem 2D em uint8 (valores 0-255).
-
-    Returns:
-        Índice inteiro da linha onde o crânio é detectado (fallback: 0).
-    """
-    h, w = img_uint8.shape
-    block_w = max(1, w // 5)       # blocos proporcionais
-    threshold_sum = 250            # limiar de soma por bloco
-
-    for row in range(h):
-        for col in range(0, w - block_w + 1, block_w):
-            if np.sum(img_uint8[row, col: col + block_w]) > threshold_sum:
-                return row
-
-    return 0  # fallback: crânio não detectado
-
-
-def prepare_for_roi_model(raw_slice: np.ndarray, 
-                          target: Tuple[int, int] = (176, 176)) -> np.ndarray:
-    """Pré-processa um slice 2D para o modelo detector de ROI (modelo_cnn1).
-
-    Estratégia sem cortes fixos:
-      1. Redimensiona para 176×256 (proporção clínica padrão).
-      2. Corta os 39% superiores (região supra-hipocampal em vista coronal).
-      3. Redimensiona para target, rotaciona 180° (orientação esperada).
-      4. Normaliza por percentil e empilha em 3 canais RGB.
-
-    Args:
-        raw_slice: Slice 2D do arquivo NIfTI.
-        target: Resolução alvo (padrão 176×176).
-
-    Returns:
-        Tensor (1, H, W, 3) float32 pronto para model.predict().
-    """
-    H_REF, W_REF = 256, 176
-
-    resized = cv2.resize(raw_slice, (W_REF, H_REF))
-    norm = robust_normalize(resized)
-    img_u8 = (norm * 255).astype(np.uint8)
-
-    # Corte proporcional: 39% do topo corresponde à região supra-hipocampal
-    cut_top = int(H_REF * 0.39)
-    cropped = img_u8[cut_top:, :]
-
-    final = cv2.resize(cropped, target)
-    final = cv2.rotate(final, cv2.ROTATE_180)
-
-    rgb = np.stack([final, final, final], axis=-1).astype(np.float32) / 255.0
+    rgb = np.stack([img_salva, img_salva, img_salva], axis=-1).astype(np.float32) / 255.0
     return rgb.reshape(1, *rgb.shape)  # (1, 176, 176, 3)
 
 
-def prepare_for_clf_model(raw_slice: np.ndarray,
-                          ini_cranio: int,
-                          int_max: float,
-                          target: Tuple[int, int] = (176, 176)) -> np.ndarray:
-    """Pré-processa um slice 2D para o modelo classificador (CNN-4).
+def find_skull_start(img8: np.ndarray) -> Optional[int]:
+    """Início do crânio (célula 13): de cima para baixo, a primeira linha com um bloco de 5 px
+    cuja soma passa de 250. Devolve None se nenhuma linha passar (o notebook pararia com erro)."""
+    for k in range(256):  # varre vertical
+        j = 0
+        while j < (176 / 5):
+            if np.sum(img8[k, 5 * j:5 * j + 5]) > 250:
+                return k
+            j = j + 1
+    return None
 
-    Usa os parâmetros extraídos do slice central (ini_cranio, int_max) para
-    garantir consistência em toda a janela de 19 slices.
 
-    Args:
-        raw_slice: Slice 2D do arquivo NIfTI.
-        ini_cranio: Linha de início do crânio (do slice central).
-        int_max: Intensidade máxima da ROI (do slice central).
-        target: Resolução alvo (padrão 176×176).
+def _recorte_cnn2(img: np.ndarray, ini_cranio: int) -> np.ndarray:
+    """176 linhas a partir de 15 linhas acima do crânio (célula 13)."""
+    if ini_cranio >= 15:
+        return img[ini_cranio - 15:ini_cranio - 15 + 176, :]
+    return img[0:176, :]
 
-    Returns:
-        Tensor (1, H, W, 3) float32.
+
+def prepare_for_clf_model(raw_slice: np.ndarray, ini_cranio: int, int_max: float) -> np.ndarray:
+    """Uma das 19 entradas da CNN2, como no laço da célula 13: imagem uint8 de 176 × 176.
+
+    Como no notebook, o brilho não é limitado: o que passa de int_max dá a volta na conversão
+    para 8 bits (256 vira 0). Foi assim que o modelo foi treinado e testado.
     """
-    H_REF, W_REF = 256, 176
-
-    resized = cv2.resize(raw_slice, (W_REF, H_REF))
-    margin = max(0, ini_cranio - 15)
-
-    safe_max = float(int_max) if int_max > 0 else 1.0
-    norm = np.clip(resized / safe_max, 0.0, 1.0)
-
-    cropped = norm[margin: margin + target[1], :]
-    img_u8 = (cropped * 255).astype(np.uint8)
-    final = cv2.resize(img_u8, target)
-
-    rgb = np.stack([final, final, final], axis=-1).astype(np.float32) / 255.0
-    return rgb.reshape(1, *rgb.shape)  # (1, 176, 176, 3)
+    new_image2 = cv2.resize(raw_slice, (176, 256))
+    img_corta1 = _recorte_cnn2(new_image2, ini_cranio)
+    slice_x = img_corta1 / int_max
+    slice_x = 255 * slice_x
+    with np.errstate(invalid="ignore", over="ignore"):  # só silencia o aviso da volta; o valor é o mesmo
+        img8 = slice_x.astype(np.uint8)
+    if img8.shape != (176, 176):
+        # crânio abaixo da linha 95: o recorte tem menos de 176 linhas e o notebook pararia com erro
+        img8 = cv2.resize(img8, (176, 176))
+    return img8
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -175,33 +144,32 @@ def scan_hippocampus_roi(img_data: np.ndarray,
                          model_roi,
                          progress_callback: Optional[Callable[..., None]] = None,
                          lote: int = LOTE_CNN1) -> Dict[str, Any]:
-    """Varre todos os cortes coronais para localizar o hipocampo.
+    """Varre todos os cortes coronais para localizar o hipocampo (célula 6 do notebook).
 
-    Para cada corte, alimenta o modelo_cnn1 e coleta o score de ROI.
-    Determina a faixa de slices onde o score >= 80% do máximo.
+    Para cada corte, alimenta a CNN1 e guarda o score. A janela são as fatias com score acima
+    de 80% do máximo, sem vales; a fatia central é o meio da janela.
 
-    Os cortes são avaliados em lotes de `lote` (o último é completado com zeros e
-    descartado), com as mesmas entradas de antes; só a chamada ao modelo muda.
+    Os cortes são avaliados em lotes de `lote` (o último é completado com zeros e descartado):
+    as entradas são as mesmas do notebook, só a chamada ao modelo muda.
 
     Args:
-        img_data: Array 3D do NIfTI (SafeImage).
+        img_data: volume IPL (índice 1 = coronal, 0 = anterior).
         model_roi: Modelo Keras para detecção de ROI.
         progress_callback: callback(percentual_da_etapa, mensagem, **extra); o extra traz
             stage="cnn1", done, total, start e os scores do lote recém-calculado.
         lote: tamanho fixo do lote.
 
     Returns:
-        Dict com:
-          - roi_scores: List[float] — scores de todos os cortes
-          - limite_inferior: int
-          - limite_superior: int
-          - slice_central: int
-          - limiar, score_max, indice_max, fallback
+        Dict com roi_scores, limite_inferior, limite_superior, slice_central, limiar,
+        score_max, indice_max e fallback (sempre False, mantido por compatibilidade).
+
+    Raises:
+        ExameInvalido: nenhuma fatia passou do limiar (no notebook, `lim_inf` não existiria).
     """
     n_coronal = img_data.shape[1]
-    scores = np.zeros(n_coronal, dtype=np.float32)
+    slice_pred = np.zeros(n_coronal)  # float64, como no notebook
 
-    # Loop 1: Calcula scores para todos os coronais, em lotes
+    # Loop 1: score de todos os cortes coronais, em lotes
     for inicio in range(0, n_coronal, lote):
         fim = min(inicio + lote, n_coronal)
         entradas = np.concatenate([prepare_for_roi_model(img_data[:, ii, :]) for ii in range(inicio, fim)])
@@ -209,113 +177,112 @@ def scan_hippocampus_roi(img_data: np.ndarray,
             preenchimento = np.zeros((lote - (fim - inicio),) + entradas.shape[1:], dtype=entradas.dtype)
             entradas = np.concatenate([entradas, preenchimento])
         saida = np.asarray(model_roi.predict_on_batch(entradas))[: fim - inicio, 0]
-        scores[inicio:fim] = saida
+        slice_pred[inicio:fim] = saida
 
         if progress_callback:
             progress_callback(fim / n_coronal * 100, f"Varredura ROI: {fim}/{n_coronal} cortes",
                               stage="cnn1", done=fim, total=n_coronal, start=inicio,
-                              scores=[round(float(s), 4) for s in scores[inicio:fim]])
+                              scores=[round(float(s), 4) for s in slice_pred[inicio:fim]])
 
     logger.debug("ROI scores calculados: min=%.4f, max=%.4f, mean=%.4f",
-                 scores.min(), scores.max(), scores.mean())
+                 slice_pred.min(), slice_pred.max(), slice_pred.mean())
 
-    threshold = scores.max() * 0.80
+    # Limiar = 80% do valor máximo
+    limiar_aj = slice_pred.max() * 0.8
 
-    # Loop 2: Define limites da ROI usando o threshold
-    candidates = np.where(scores >= threshold)[0]
-    fallback = len(candidates) == 0
-    if fallback:
-        lim_inf, lim_sup = n_coronal // 3, 2 * n_coronal // 3
-        logger.warning("Nenhum score >= threshold. Usando fallback: [%d, %d]",
-                       lim_inf, lim_sup)
-    else:
-        lim_inf, lim_sup = int(candidates[0]), int(candidates[-1])
+    # Limites: a primeira e a última fatia acima do limiar
+    acima = np.flatnonzero(slice_pred > limiar_aj)
+    if len(acima) == 0:
+        raise ExameInvalido("A CNN1 não encontrou a região do hipocampo neste exame "
+                            "(nenhuma fatia passou do limiar).")
+    lim_inf, lim_sup = int(acima[0]), int(acima[-1])
 
-    # Loop 3: Remove vales internos abaixo do limiar
-    interval = scores[lim_inf: lim_sup + 1]
-    while len(interval) > 0 and interval.min() < threshold:
-        min_pos = lim_inf + int(np.argmin(interval))
-        if (min_pos - lim_inf) < (lim_sup - min_pos):
-            lim_inf = min_pos + 1
-        else:
-            lim_sup = min_pos - 1
-        interval = scores[lim_inf: lim_sup + 1]
-        if len(interval) == 0:
-            break
+    # Remove os vales abaixo do limiar, encolhendo a janela pelo lado mais perto do vale
+    intervalo = slice_pred[lim_inf:lim_sup]
+    if len(intervalo) != 0:
+        while min(intervalo) < limiar_aj:
+            minimo = lim_inf + np.where(intervalo == intervalo.min())[0][0]
+            if minimo - lim_inf < lim_sup - minimo:
+                lim_inf = minimo + 1
+            else:
+                lim_sup = minimo - 1
+            intervalo = slice_pred[lim_inf:lim_sup]
+            if len(intervalo) == 0:
+                break
 
-    sl_central = int(round((lim_inf + lim_sup) / 2)) #valor sl_central de cada varredura
+    sl_central = round((lim_inf + lim_sup) / 2)
 
-    logger.info("ROI detectada: [%d, %d] → slice_central=%d (threshold=%.4f)",
-                lim_inf, lim_sup, sl_central, threshold)
+    logger.info("ROI detectada: [%d, %d] → slice_central=%d (limiar=%.4f)",
+                lim_inf, lim_sup, sl_central, limiar_aj)
 
     return {
-        "roi_scores": scores.tolist(),
+        "roi_scores": slice_pred.tolist(),
         "limite_inferior": int(lim_inf),
         "limite_superior": int(lim_sup),
         "slice_central": int(sl_central),
-        "limiar": float(threshold),
-        "score_max": float(scores.max()),
-        "indice_max": int(np.argmax(scores)),
-        "fallback": bool(fallback),
+        "limiar": float(limiar_aj),
+        "score_max": float(slice_pred.max()),
+        "indice_max": int(np.argmax(slice_pred)),
+        "fallback": False,
     }
 
 
 def build_roi_dataset(img_data: np.ndarray, sl_central: int) -> Tuple[List, int, float]:
-    """Constrói o dataset de 19 slices ao redor do corte central.
+    """Monta as 19 fatias em torno do corte central (célula 13 do notebook).
 
-    Extrai dois parâmetros do slice central como referência:
-      - ini_cranio: linha de início do crânio
-      - int_max: 90% da intensidade máxima da ROI central
+    Da fatia central saem dois valores que valem para as 19:
+      - ini_cranio: linha onde o crânio começa (blocos de 5 px);
+      - int_max: 90% da intensidade máxima do recorte central.
 
     Args:
-        img_data: Array 3D do NIfTI.
-        sl_central: Índice do slice central a ser usado como referência.
+        img_data: volume IPL.
+        sl_central: índice da fatia central.
 
     Returns:
-        Tupla (dataset, ini_cranio, int_max) onde:
-          - dataset: List[np.ndarray] — 19 slices uint8 (176×176)
-          - ini_cranio: int
-          - int_max: float
+        Tupla (dataset, ini_cranio, int_max), com dataset = 19 imagens uint8 (176×176)
+        na ordem de OFFSETS.
     """
-    H_REF, W_REF = 256, 176
     n_coronal = img_data.shape[1]
 
-    # Extrai parâmetros do slice central
-    central_raw = cv2.resize(img_data[:, sl_central, :], (W_REF, H_REF))
-    central_u8 = (robust_normalize(central_raw) * 255).astype(np.uint8)
-    ini_cranio = find_skull_start(central_u8)
+    # Início do crânio, na fatia central redimensionada para 256 × 176 e em 8 bits
+    new_image2 = cv2.resize(img_data[:, sl_central, :], (176, 256))
+    img_corta2 = new_image2
+    slice_x = img_corta2 / img_corta2.max()
+    slice_x = 255 * slice_x
+    img8 = slice_x.astype(np.uint8)
+    ini_cranio = find_skull_start(img8)
+    if ini_cranio is None:  # fatia praticamente vazia; o notebook pararia com erro
+        ini_cranio = 0
 
-    margin = max(0, ini_cranio - 15)
-    roi_central = central_raw[margin: margin + 176, :]
-    int_max = float(roi_central.max()) * 0.90 if roi_central.size > 0 else 1.0
+    # Máxima intensidade do recorte central
+    img_corta1 = _recorte_cnn2(img_corta2, ini_cranio)
+    int_max = img_corta1.max() * 0.9
 
-    logger.debug("Parâmetros extraídos: ini_cranio=%d, int_max=%.2f",
-                 ini_cranio, int_max)
+    logger.debug("Parâmetros extraídos: ini_cranio=%d, int_max=%.2f", ini_cranio, int_max)
 
-    # Constrói dataset de 19 slices
+    # As 19 fatias. O índice fica dentro do volume (o notebook não limita, mas com a fatia
+    # central longe das bordas isso nunca muda nada)
     dataset = []
     for offset in OFFSETS:
         idx = max(0, min(sl_central + offset, n_coronal - 1))
-        inp = prepare_for_clf_model(img_data[:, idx, :], ini_cranio, int_max)
-        # Armazena como uint8 (176×176)
-        dataset.append((inp[0, :, :, 0] * 255).astype(np.uint8))
+        dataset.append(prepare_for_clf_model(img_data[:, idx, :], ini_cranio, int_max))
 
-    return dataset, ini_cranio, int_max
+    return dataset, int(ini_cranio), float(int_max)
 
 
 def classify_alzheimer(dataset: List[np.ndarray],
                        model_clf,
                        progress_callback: Optional[Callable[..., None]] = None,
                        ) -> Dict[str, Any]:
-    """Classifica cada slice do dataset e agrega o resultado com estatísticas.
+    """Classifica as 19 fatias e agrega o resultado (células 16, 18 e 20 do notebook).
 
     Retorna:
-      - predicoes_19_slices: List[float] — scores brutos dos 19 slices
-      - probabilidade_media: float — média das probabilidades
+      - predicoes_19_slices: List[float] — P(DA) de cada fatia (coluna 0)
+      - probabilidade_media: float — média das 19
       - desvio_padrao: float — desvio padrão
       - coeficiente_variacao: float — CV (desvio/média ou desvio/(1-média))
       - classificacao_cv: str — classificação qualitativa do CV
-      - diagnostico: str — "ALZHEIMER" ou "NORMAL"
+      - diagnostico: str — "ALZHEIMER" (média > 0,5) ou "NORMAL"
       - votos_alzheimer: int — fatias com probabilidade > 0,5 (informativo)
 
     Args:
@@ -385,7 +352,6 @@ def _classificar_cv(valor: float) -> str:
         return "Moderate variability"
     else:
         return "High variability"
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # BLOCO 3 — Leitura e validação do volume e dados para o painel
@@ -497,7 +463,8 @@ def run_pipeline(nifti_path: str,
     # Passo 1: Carrega NIfTI e extrai metadados
     # ──────────────────────────────────────────────────────────────────────
     img_ni = carregar_volume(nifti_path)
-    img_data = _fatias_contiguas(nib.as_closest_canonical(img_ni).get_fdata())
+    # Volume IPL, como no notebook: img_data[:, ii, :] é a fatia coronal ii em pé (0 = anterior)
+    img_data = _fatias_contiguas(volume_ipl(img_ni))
 
     # Extrai dimensões e spacing (zooms)
     dimensoes = list(img_ni.shape)
@@ -522,13 +489,15 @@ def run_pipeline(nifti_path: str,
     n_coronal = img_data.shape[1]
     indices = [max(0, min(central + o, n_coronal - 1)) for o in OFFSETS]
     dataset, ini_cranio, int_max = build_roi_dataset(img_data, central)
-    margem = max(0, ini_cranio - 15)
-    # Faixa de cada fatia que as redes recebem, em voxels do espaço canônico. As linhas da
-    # fatia img_data[:, j, :] são o eixo x (esquerda → direita), redimensionado para 256.
+    margem = ini_cranio - 15 if ini_cranio >= 15 else 0
+    # Faixa de cada fatia que as redes recebem, em voxels do eixo z canônico (inferior → superior).
+    # As linhas da fatia IPL vão de cima para baixo: a linha r da imagem de altura h é z = h − r.
     n_linhas = img_data.shape[0]
-    recorte_cnn1 = {"eixo": "x", "inicio": 99 / 256 * n_linhas, "fim": float(n_linhas)}
-    recorte_cnn2 = {"eixo": "x", "inicio": margem / 256 * n_linhas,
-                    "fim": min(256, margem + 176) / 256 * n_linhas}
+    altura_cnn1 = 256 if img_data.shape[2] < 176 else n_linhas  # célula 6: só redimensiona abaixo de 176
+    # a CNN1 corta as linhas 65–219 da fatia girada 180°, que já estão no sentido de z
+    recorte_cnn1 = {"eixo": "z", "inicio": 65 / altura_cnn1 * n_linhas, "fim": 220 / altura_cnn1 * n_linhas}
+    recorte_cnn2 = {"eixo": "z", "inicio": (256 - min(256, margem + 176)) / 256 * n_linhas,
+                    "fim": (256 - margem) / 256 * n_linhas}
     cb(100, "19 fatias extraídas", stage="extract", total=len(dataset))
 
     logger.debug("Dataset construído: 19 slices, ini_cranio=%d", ini_cranio)
@@ -548,9 +517,9 @@ def run_pipeline(nifti_path: str,
             "cnn2_sprite": sprite,
             "grade": grade,
             "cnn1_central": _webp((entrada_cnn1[0, :, :, 0] * 255).astype(np.uint8)),
-            # para onde apontam as linhas e colunas de cada imagem (letras RAS/LPI)
-            "orientacao_cnn2": {"linhas": "R", "colunas": "S"},
-            "orientacao_cnn1": {"linhas": "L", "colunas": "I"},
+            # para onde apontam as linhas e colunas de cada imagem (letras RAS/LPI): em pé, como no IPL
+            "orientacao_cnn2": {"linhas": "I", "colunas": "L"},
+            "orientacao_cnn1": {"linhas": "I", "colunas": "L"},
         }
     t_visual = time.perf_counter()
 
@@ -583,6 +552,8 @@ def run_pipeline(nifti_path: str,
             "dimensoes_canonicas": dims_canon,
             "espacamento_canonico": zooms_canon,
             "orientacao_original": "".join(nib.aff2axcodes(img_ni.affine)),
+            # orientação em que as redes recebem o volume; os índices das fatias são nela (0 = anterior)
+            "orientacao_analise": "".join(ORIENTACAO_ANALISE),
             "ornt": ornt,
             "tipo_dado": str(img_ni.header.get_data_dtype()),
         },
