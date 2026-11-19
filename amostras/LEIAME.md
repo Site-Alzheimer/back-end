@@ -4,8 +4,12 @@ Esta pasta é lida pela API (`AMOSTRAS_DIR`, padrão `amostras/`) e alimenta o c
 front. Só este arquivo é versionado: os exames e as miniaturas são dados de pacientes e ficam
 fora do git (veja o `.gitignore`).
 
-Antes de publicar qualquer exame, confira a licença. O termo de uso do ADNI proíbe
-redistribuir os dados; para o site público use bases que permitam, como a IXI (CC BY-SA 3.0).
+O arquivo de um exame não sai do servidor: não há rota para baixá-lo, a análise roda na API e o
+front mostra só as imagens que ela devolve. Assim os exames do ADNI ficam só no carrossel, para
+testar o site, como combinado com o Dr. Saraiva (19/11/2026).
+
+Em hospedagem sem disco próprio (o Space do Hugging Face), a API baixa esta pasta inteira de
+`AMOSTRAS_URL` ao ligar: um zip com o `amostras.json`, os exames e as miniaturas na raiz.
 
 ## `amostras.json`
 
@@ -13,12 +17,14 @@ redistribuir os dados; para o site público use bases que permitam, como a IXI (
 {
   "amostras": [
     {
-      "id": "adni-002-s-0619",
+      "id": "adni-005-s-0221",
       "rotulo": "Exame de exemplo 1",
       "fonte": "ADNI",
       "diagnostico_clinico": "AD",
+      "idade": 68,
+      "sexo": "M",
       "licenca": "ADNI Data Use Agreement — uso restrito, não redistribuir",
-      "arquivo": "AD_002_S_0619.nii.gz"
+      "arquivo": "005_S_0221.nii.gz"
     }
   ]
 }
@@ -26,6 +32,8 @@ redistribuir os dados; para o site público use bases que permitam, como a IXI (
 
 - `arquivo`: caminho relativo a esta pasta (`.nii` ou `.nii.gz`).
 - `diagnostico_clinico`: rótulo da base (`AD`, `CN`, `MCI`), só informativo.
+- `idade` e `sexo` (`F` ou `M`): opcionais, aparecem no card do carrossel. Os de hoje vêm do
+  `ADNI_Pacientes.csv` que o Dr. Saraiva mandou.
 
 Depois de editar o manifesto, gere as miniaturas:
 

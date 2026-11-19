@@ -9,7 +9,6 @@ Endpoints:
        ?job_id=&visualizacao=true&explicacao=false
   POST /v1/predict/alzheimer/amostra/{id} — Mesma resposta, com um exame de exemplo do servidor
   GET  /v1/amostras                 — Exames de exemplo (pasta AMOSTRAS_DIR)
-  GET  /v1/amostras/{id}/arquivo    — NIfTI da amostra
   GET  /v1/amostras/{id}/miniatura  — Miniatura WebP da amostra
   GET  /v1/progress/{job_id}        — Progresso por SSE: {"stage":"ready"} ao conectar, depois
                                       load → cnn1 (lotes com scores) → extract → cnn2 → done
@@ -66,7 +65,7 @@ from functools import partial
 
 # Importa o motor de inferência
 from engine import LOTE_CNN1, PESOS_ETAPAS, ExameInvalido, explicar_gradcam, run_pipeline
-from model_loader import ensure_models
+from model_loader import ensure_amostras, ensure_models
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -316,6 +315,7 @@ async def lifespan(app: FastAPI):
     Os modelos ficam disponíveis durante toda a vida da aplicação.
     """
     ensure_models(MODEL_ROI_PATH, MODEL_CLF_PATH)
+    ensure_amostras(AMOSTRAS_DIR)
 
     logger.info("Carregando modelo de ROI: %s", MODEL_ROI_PATH)
     try:
@@ -645,6 +645,8 @@ class Amostra(BaseModel):
     fonte: str
     diagnostico_clinico: Optional[str] = None
     licenca: Optional[str] = None
+    idade: Optional[int] = Field(None, description="Idade do participante no exame (anos)")
+    sexo: Optional[Literal["F", "M"]] = Field(None, description="Sexo do participante")
     arquivo: str
     tamanho_bytes: int
     tem_miniatura: bool
@@ -681,20 +683,12 @@ async def listar_amostras():
     return [
         Amostra(id=a["id"], rotulo=a["rotulo"], fonte=a["fonte"],
                 diagnostico_clinico=a.get("diagnostico_clinico"), licenca=a.get("licenca"),
+                idade=a.get("idade"), sexo=a.get("sexo"),
                 arquivo=os.path.basename(a["arquivo"]),
                 tamanho_bytes=os.path.getsize(_caminho_amostra(a["arquivo"])),
                 tem_miniatura=bool(a.get("miniatura")) and os.path.isfile(_caminho_amostra(a["miniatura"])))
         for a in _amostras()
     ]
-
-
-@app.get("/v1/amostras/{amostra_id}/arquivo", tags=["amostras"])
-async def arquivo_amostra(amostra_id: str):
-    """O arquivo NIfTI da amostra (o navegador usa para mostrar a ressonância)."""
-    a = _amostra(amostra_id)
-    caminho = _caminho_amostra(a["arquivo"])
-    tipo = "application/gzip" if caminho.endswith(".gz") else "application/octet-stream"
-    return FileResponse(caminho, media_type=tipo, filename=os.path.basename(caminho))
 
 
 @app.get("/v1/amostras/{amostra_id}/miniatura", tags=["amostras"])

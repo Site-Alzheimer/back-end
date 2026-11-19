@@ -3,7 +3,9 @@
 # a API baixa do Google Drive no startup (MODEL_ROI_URL e MODEL_CLF_URL, segredos do Space).
 FROM ghcr.io/site-alzheimer/back-end:main
 
-# O Space roda o contêiner com o usuário 1000, que só escreve em /tmp e na própria pasta
+# O Space roda o contêiner com o usuário 1000, que só escreve em /tmp e na própria pasta.
+# Os exames de exemplo vêm de AMOSTRAS_URL (outro segredo): um Space público mostra os arquivos dele
 ENV MODEL_ROI_PATH=/tmp/models/modelo_cnn3_L20_3A5.h5 \
-    MODEL_CLF_PATH=/tmp/models/CNN-4-2023-1.h5 \
+    MODEL_CLF_PATH=/tmp/models/CNN-4-Site.h5 \
+    AMOSTRAS_DIR=/tmp/amostras \
     PORT=8000

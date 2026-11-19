@@ -509,7 +509,8 @@ antigas do front.
 ### Exames de exemplo
 
 - `GET /v1/amostras` lista os exames;
-- `GET /v1/amostras/{id}/arquivo` e `/miniatura` servem o arquivo e a miniatura;
+- `GET /v1/amostras/{id}/miniatura` serve a miniatura. O arquivo do exame não sai do servidor (os exemplos são
+  do ADNI, que não permite redistribuir): a análise roda na API, e o front mostra só as imagens que ela devolve;
 - `POST /v1/predict/alzheimer/amostra/{id}` analisa sem upload, com a mesma resposta do predict.
 
 ### Scripts (rodar dentro do container)

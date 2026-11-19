@@ -9,6 +9,8 @@ do Google Drive usando gdown. Isso permite manter os .h5 fora da imagem Docker.
 
 import logging
 import os
+import tempfile
+import zipfile
 from pathlib import Path
 
 import gdown
@@ -53,3 +55,34 @@ def ensure_models(roi_path: str, clf_path: str) -> None:
 
     _download_if_missing(roi_path, roi_url, "ROI", "MODEL_ROI_URL")
     _download_if_missing(clf_path, clf_url, "classificador", "MODEL_CLF_URL")
+
+
+def ensure_amostras(pasta: str) -> None:
+    """Baixa os exames de exemplo (zip com amostras.json, exames e miniaturas) de AMOSTRAS_URL.
+
+    Serve para hospedagens sem disco próprio, como o Space do Hugging Face: o zip fica num link
+    guardado como segredo, e os exames não aparecem nos arquivos públicos. Sem a variável, ou com a
+    pasta já pronta, nada muda. Uma falha aqui não derruba a API: o carrossel só fica vazio.
+    """
+    url = os.getenv("AMOSTRAS_URL")
+    destino = Path(pasta)
+    if not url or (destino / "amostras.json").exists():
+        return
+
+    logger.info("Exames de exemplo nao encontrados em %s. Baixando de AMOSTRAS_URL...", destino)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = Path(tmp) / "amostras.zip"
+            gdown.download(url=url, output=str(zip_path), quiet=True, fuzzy=True)
+            destino.mkdir(parents=True, exist_ok=True)
+            base = destino.resolve()
+            with zipfile.ZipFile(zip_path) as z:
+                for nome in z.namelist():
+                    # nenhum caminho do zip pode sair da pasta de destino
+                    if not (base / nome).resolve().is_relative_to(base):
+                        raise RuntimeError(f"Caminho invalido no zip: {nome}")
+                z.extractall(base)
+        logger.info("Exames de exemplo prontos em %s", destino)
+    except Exception as exc:
+        logger.warning("Exames de exemplo indisponiveis (%s: %s). O carrossel fica vazio.",
+                       type(exc).__name__, exc)
