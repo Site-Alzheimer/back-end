@@ -11,8 +11,9 @@ Endpoints:
   GET  /v1/amostras                 — Exames de exemplo (pasta AMOSTRAS_DIR)
   GET  /v1/amostras/{id}/arquivo    — NIfTI da amostra
   GET  /v1/amostras/{id}/miniatura  — Miniatura WebP da amostra
-  WS   /ws/progress/{job_id}        — Progresso: {"stage":"ready"} ao conectar, depois
+  GET  /v1/progress/{job_id}        — Progresso por SSE: {"stage":"ready"} ao conectar, depois
                                       load → cnn1 (lotes com scores) → extract → cnn2 → done
+  WS   /ws/progress/{job_id}        — O mesmo progresso por WebSocket (versões antigas do front)
 
 Uso:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
@@ -57,9 +58,9 @@ import tensorflow as tf
 from tensorflow_addons.metrics import F1Score
 
 import asyncio
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from functools import partial
 
@@ -88,7 +89,7 @@ MODELS: dict = {}
 # Exames de exemplo servidos pela API (pasta local, ignorada pelo git)
 AMOSTRAS_DIR = os.getenv("AMOSTRAS_DIR", "amostras")
 
-# job_id vem do cliente e vira chave do WebSocket: aceita UUID e identificadores simples
+# job_id vem do cliente e vira chave do progresso: aceita UUID e identificadores simples
 JOB_ID_VALIDO = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
 
@@ -381,35 +382,96 @@ app.add_middleware(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Gerenciador de conexões WebSocket para progresso
+# Progresso das análises: SSE (GET /v1/progress/{job_id}) e o WebSocket antigo
 # ──────────────────────────────────────────────────────────────────────
 
-class ConnectionManager:
+# Comentário SSE a cada 15 s sem progresso: o nginx fecha a conexão depois de 60 s parada
+SSE_PING_S = 15
+# Tempo máximo de um stream (a análise mais lenta, na VM, leva ~40 s)
+SSE_MAX_S = 600
+
+
+class ProgressHub:
+    """Entrega o progresso de cada job_id a quem acompanha a análise: um stream SSE ou, nas
+    versões antigas do front, um WebSocket."""
+
     def __init__(self):
-        self.active: dict[str, WebSocket] = {}
+        self.filas: dict[str, asyncio.Queue] = {}
+        self.sockets: dict[str, WebSocket] = {}
+
+    def abrir_fila(self, job_id: str) -> asyncio.Queue:
+        fila: asyncio.Queue = asyncio.Queue()
+        self.filas[job_id] = fila  # se o EventSource reconectar, a fila nova substitui a antiga
+        return fila
+
+    def fechar_fila(self, job_id: str, fila: asyncio.Queue):
+        if self.filas.get(job_id) is fila:
+            del self.filas[job_id]
 
     async def connect(self, job_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active[job_id] = websocket
+        self.sockets[job_id] = websocket
 
     def disconnect(self, job_id: str):
-        self.active.pop(job_id, None)
+        self.sockets.pop(job_id, None)
 
     async def send_progress(self, job_id: str, data: dict):
-        ws = self.active.get(job_id)
+        fila = self.filas.get(job_id)
+        if fila is not None:
+            fila.put_nowait(data)
+        ws = self.sockets.get(job_id)
         if ws:
             try:
                 await ws.send_json(data)
             except Exception:
                 self.disconnect(job_id)
 
-manager = ConnectionManager()
+manager = ProgressHub()
+
+
+def _evento_sse(dados: dict) -> str:
+    return f"data: {json.dumps(dados, separators=(',', ':'), ensure_ascii=False)}\n\n"
 
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Endpoints
 # ═════════════════════════════════════════════════════════════════════════════
+@app.get("/v1/progress/{job_id}", tags=["inference"], summary="Progresso da análise (Server-Sent Events)")
+async def progresso_sse(job_id: str, request: Request):
+    """Stream `text/event-stream` com o progresso da análise de mesmo `job_id`.
+
+    O primeiro evento é `{"stage": "ready"}`: o cliente só envia o exame depois dele. Os seguintes
+    têm o formato das mensagens do WebSocket (load → cnn1 → extract → cnn2 → done). O stream fica
+    aberto até o cliente fechar (ou `SSE_MAX_S`)."""
+    _validar_job_id(job_id)
+
+    async def eventos():
+        fila = manager.abrir_fila(job_id)
+        relogio = asyncio.get_running_loop().time
+        fim = relogio() + SSE_MAX_S
+        try:
+            # O cliente espera este evento antes de enviar o arquivo, para não perder o início do progresso
+            yield _evento_sse({"progress": 0, "status": "Conectado", "stage": "ready"})
+            while (resta := fim - relogio()) > 0:
+                try:
+                    dados = await asyncio.wait_for(fila.get(), timeout=min(SSE_PING_S, resta))
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    yield ": ping\n\n"
+                    continue
+                yield _evento_sse(dados)
+        finally:
+            manager.fechar_fila(job_id, fila)
+
+    return StreamingResponse(eventos(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # o nginx repassa cada evento na hora, sem juntar num buffer
+    })
+
+
+# Versões antigas do front (antes do SSE) ainda abertas nos navegadores
 @app.websocket("/ws/progress/{job_id}")
 async def websocket_progress(websocket: WebSocket, job_id: str):
     if not JOB_ID_VALIDO.match(job_id):

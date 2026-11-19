@@ -470,7 +470,7 @@ confere isso contra respostas gravadas antes das mudanças.
 
 | Parâmetro | Padrão | Efeito |
 |---|---|---|
-| `job_id` | — | Identificador do WebSocket de progresso (8 a 64 caracteres: letras, números e hífen) |
+| `job_id` | — | Identificador do progresso ao vivo (8 a 64 caracteres: letras, números e hífen) |
 | `visualizacao` | `true` | Inclui `imagens`: as 19 entradas da CNN2 (sprite WebP sem perda) e a entrada da CNN1 |
 | `explicacao` | `false` | Inclui `gradcam`: mapas Grad-CAM da CNN2 (última Conv2D, grade 5×5) |
 
@@ -489,12 +489,22 @@ recebe **400**, com a mensagem, em vez de 500.
 | `GRADCAM_CAMADA` | última Conv2D | Camada usada na Grad-CAM |
 | `AMOSTRAS_DIR` | `amostras` | Pasta dos exames de exemplo (veja `amostras/LEIAME.md`) |
 
-### Progresso pelo WebSocket
+### Progresso ao vivo (SSE)
 
-Ao conectar em `/ws/progress/{job_id}`, o servidor envia `{"stage": "ready"}`. O cliente deve
-esperar essa mensagem antes de enviar o exame. Depois chegam as etapas `load`, `cnn1` (8 lotes,
-cada um com `start`, `done`, `total` e os `scores` calculados), `extract`, `cnn2` e `done`. O campo
-`progress` agora só cresce.
+`GET /v1/progress/{job_id}` abre um stream `text/event-stream` (Server-Sent Events; no navegador,
+`EventSource`). O primeiro evento é `{"stage": "ready"}`, e o cliente deve esperar por ele antes de
+enviar o exame. Depois chegam as etapas `load`, `cnn1` (8 lotes, cada um com `start`, `done`, `total`
+e os `scores` calculados), `extract`, `cnn2` e `done`. O campo `progress` só cresce. O stream fica
+aberto até o cliente fechar; sem progresso, o servidor manda um comentário (`: ping`) a cada 15 s
+para o proxy não fechar a conexão, e a resposta leva `X-Accel-Buffering: no` para o nginx não
+segurar os eventos.
+
+```bash
+curl -N http://localhost:8000/v1/progress/teste-123
+```
+
+O WebSocket `/ws/progress/{job_id}`, usado antes, continua com as mesmas mensagens para as versões
+antigas do front.
 
 ### Exames de exemplo
 
