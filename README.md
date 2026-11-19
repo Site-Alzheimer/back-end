@@ -513,6 +513,53 @@ antigas do front.
   do ADNI, que não permite redistribuir): a análise roda na API, e o front mostra só as imagens que ela devolve;
 - `POST /v1/predict/alzheimer/amostra/{id}` analisa sem upload, com a mesma resposta do predict.
 
+### Fila de análises (RabbitMQ)
+
+Com `RABBITMQ_URL` definida, a API não roda as CNNs: ela põe cada exame numa fila do RabbitMQ, e o
+worker (`worker.py`, mesma imagem, comando `python worker.py`) analisa um exame por vez. Sem a
+variável, tudo funciona como antes (a API carrega as CNNs e analisa direto).
+
+```
+Navegador ─POST─> API ─publica─> fila "neuroia.analises" ─1 por vez─> worker (as CNNs)
+    ▲              │                                                     │
+    └──── SSE ─────┴──<── exchange "neuroia.eventos" (progresso e fim) <─┘
+```
+
+- `POST /v1/analises?job_id=` (arquivo) e `POST /v1/analises/amostra/{id}` respondem `202` na hora,
+  com `posicao` e o cabeçalho `Location` do resultado;
+- `GET /v1/analises/{job_id}`: `200` com a mesma resposta do predict (guardada por `RESULTADO_TTL_S`,
+  1 h), `202` enquanto espera, `404` se não existe ou venceu. Se a análise falhou, o mesmo erro que a
+  análise direta daria (`400` para exame inválido);
+- o SSE de mesmo `job_id` ganha `queued` (com `posicao`, enquanto espera), `start` (o worker pegou o
+  exame) e `result` (com `http_status`, o resultado está guardado);
+- `/v1/predict/...` também passa pela fila, com a mesma resposta de antes;
+- `/healthz` traz `fila` (`workers` e `aguardando`), e `models_loaded` diz se há worker conectado.
+
+Garantias:
+- **ordem e um por vez:** `prefetch_count=1`. Mais workers na mesma fila dividem os exames;
+- **nada se perde:** mensagens persistentes, confirmadas pelo broker (publisher confirms), numa fila
+  quorum. O worker só confirma (ack) depois de gravar o resultado; se cair no meio, o exame volta para
+  a fila;
+- **exame que derruba o worker:** a fila conta as entregas (`x-delivery-count`). Na 3ª, vira erro em
+  vez de voltar de novo. Acima de `x-delivery-limit` (5), vai para `neuroia.analises.falhas`;
+- **idempotência:** um exame que já tem resultado gravado não é analisado de novo;
+- **desligamento:** com SIGTERM, o worker para de pegar exames, termina o atual e sai.
+
+O arquivo enviado não vai na mensagem: ele fica em `FILA_DIR`, que a API e o worker enxergam, e a
+mensagem leva o caminho. Como a API não importa o TensorFlow, ela usa ~100 MB de memória.
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `RABBITMQ_URL` | (vazia: sem fila) | `amqp://usuario:senha@host:5672/` |
+| `FILA_DIR` | `/tmp/neuroia-fila` | Exames enviados e resultados (pasta compartilhada) |
+| `RESULTADO_TTL_S` | `3600` | Por quanto tempo o resultado fica guardado |
+
+Onde roda:
+- **VM:** `deploy/compose.yml` tem os serviços `rabbitmq`, `api` e `worker` (a senha fica em
+  `/opt/neuroia/.env`, `RABBITMQ_SENHA=...`). O painel do RabbitMQ fica em `127.0.0.1:15672`;
+- **Space do Hugging Face** (um contêiner só): `deploy/huggingface/Dockerfile` instala o RabbitMQ, e
+  `scripts/conteiner-unico.sh` sobe os três processos.
+
 ### Scripts (rodar dentro do container)
 
 ```bash
@@ -521,6 +568,10 @@ python scripts/paridade.py /data/AD_002_S_0619.nii /data/CN_002_S_0295.nii --ref
 
 # Miniaturas do carrossel
 python scripts/gerar_miniaturas.py amostras
+
+# Teste de ponta a ponta da fila, numa API com a fila ativa (de preferência com uma sem fila para comparar)
+python scripts/testar_fila.py --api http://127.0.0.1:8000 --arquivo amostras/005_S_0221.nii.gz \
+    --referencia http://127.0.0.1:8001
 ```
 
 ### Desempenho

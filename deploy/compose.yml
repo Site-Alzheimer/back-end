@@ -1,30 +1,98 @@
 # Produção na VM do IFCE: o site inteiro em https://neuroia.ifce.edu.br.
 # Na VM: /opt/neuroia/compose.yml é um link para este arquivo (no clone do repositório).
-# O nginx da VM (fora do Docker) faz o HTTPS e repassa para estes dois containers, que só
-# escutam em 127.0.0.1. As imagens são montadas pelo GitHub Actions e publicadas no GHCR.
+# O nginx da VM (fora do Docker) faz o HTTPS e repassa para a API e o site, que só escutam em
+# 127.0.0.1. As imagens são montadas pelo GitHub Actions e publicadas no GHCR.
+#
+# Fila de análises (desde nov/2026): a API põe cada exame no RabbitMQ, e o worker (mesma imagem da
+# API, outro comando) roda as CNNs, um exame por vez. A senha do RabbitMQ fica em /opt/neuroia/.env
+# (RABBITMQ_SENHA=..., só letras e números), fora do repositório.
 name: neuroia
 
+x-fila: &fila
+  RABBITMQ_URL: amqp://neuroia:${RABBITMQ_SENHA:?defina RABBITMQ_SENHA em /opt/neuroia/.env}@rabbitmq:5672/
+  # Exames enviados e resultados (guardados por 1 h): a API e o worker enxergam a mesma pasta
+  FILA_DIR: /fila
+
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    # Nome fixo: o RabbitMQ guarda os dados por nome de nó, que vem do hostname
+    hostname: neuroia-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: neuroia
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_SENHA:?defina RABBITMQ_SENHA em /opt/neuroia/.env}
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+    ports:
+      # Painel de gestão, só pela própria VM (ssh -L 15672:127.0.0.1:15672 ...)
+      - "127.0.0.1:15672:15672"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+
   api:
     image: ghcr.io/site-alzheimer/back-end:main
     restart: unless-stopped
     environment:
-      MODEL_ROI_PATH: /models/modelo_cnn3_L20_3A5.h5
-      MODEL_CLF_PATH: /models/CNN-4-2023-1.h5
+      <<: *fila
       AMOSTRAS_DIR: /amostras
       # Front no mesmo domínio: nenhum outro site chama a API pelo navegador
       CORS_ORIGINS: https://neuroia.ifce.edu.br
     volumes:
-      - /opt/neuroia/models:/models:ro
       - /opt/neuroia/amostras:/amostras:ro
+      - fila:/fila
     ports:
       - "127.0.0.1:8000:8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          # Com a fila, a API não carrega o TensorFlow (~100 MB em uso)
+          memory: 1g
+    healthcheck:
+      # models_loaded: há worker conectado na fila (ele só consome depois de carregar as CNNs)
+      test: ["CMD", "/opt/conda/bin/python", "-c", "import json, sys, urllib.request as u; sys.exit(0 if json.load(u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)).get('models_loaded') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 3m
+
+  worker:
+    image: ghcr.io/site-alzheimer/back-end:main
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    environment:
+      <<: *fila
+      MODEL_ROI_PATH: /models/modelo_cnn3_L20_3A5.h5
+      # CNN2 nova do professor (19/11/2026); a anterior era CNN-4-2023-1.h5
+      MODEL_CLF_PATH: /models/CNN-4-Site.h5
+    volumes:
+      - /opt/neuroia/models:/models:ro
+      # Mesmo caminho da API: o pedido na fila leva o caminho do exame de exemplo
+      - /opt/neuroia/amostras:/amostras:ro
+      - fila:/fila
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    # SIGTERM: o worker termina o exame em análise (~40 s na VM) antes de sair
+    stop_grace_period: 2m
     deploy:
       resources:
         limits:
           memory: 3g
     healthcheck:
-      test: ["CMD", "/opt/conda/bin/python", "-c", "import json, sys, urllib.request as u; sys.exit(0 if json.load(u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)).get('models_loaded') else 1)"]
+      # O worker atualiza este arquivo a cada 15 s enquanto está conectado ao RabbitMQ
+      test: ["CMD", "/opt/conda/bin/python", "-c", "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/neuroia-worker-vivo') < 60 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -40,3 +108,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  rabbitmq:
+  fila:

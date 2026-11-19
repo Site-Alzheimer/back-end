@@ -36,7 +36,13 @@ for servico in api web; do
   echo "$servico: versão nova ${nova:7:12} (antes ${atual:7:12})"
   [[ -n "$atual" ]] && docker tag "$atual" "$repo:anterior"
 
-  if docker compose up -d --wait --wait-timeout "${NEUROIA_ESPERA:-300}" "$servico"; then
+  # O worker da fila usa a mesma imagem da API: os dois sobem juntos
+  alvos=("$servico")
+  if [[ "$servico" == api ]] && docker compose config --services | grep -qx worker; then
+    alvos+=(worker)
+  fi
+
+  if docker compose up -d --wait --wait-timeout "${NEUROIA_ESPERA:-300}" "${alvos[@]}"; then
     echo "$servico: no ar e saudável"
     rm -f ".ruim-$servico"
   else
@@ -46,7 +52,7 @@ for servico in api web; do
     if [[ -n "$atual" ]]; then
       echo "$servico: voltando para a anterior"
       docker tag "$atual" "$imagem"
-      docker compose up -d --wait --wait-timeout "${NEUROIA_ESPERA:-300}" "$servico" || echo "$servico: ATENÇÃO, a anterior também não subiu"
+      docker compose up -d --wait --wait-timeout "${NEUROIA_ESPERA:-300}" "${alvos[@]}" || echo "$servico: ATENÇÃO, a anterior também não subiu"
     fi
   fi
 done

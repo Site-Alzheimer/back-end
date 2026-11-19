@@ -14,6 +14,13 @@ Endpoints:
                                       load → cnn1 (lotes com scores) → extract → cnn2 → done
   WS   /ws/progress/{job_id}        — O mesmo progresso por WebSocket (versões antigas do front)
 
+Fila de análises (RabbitMQ, só com RABBITMQ_URL; ver fila.py e worker.py):
+  POST /v1/analises?job_id=         — Põe um exame enviado na fila: 202 com job_id e posição
+  POST /v1/analises/amostra/{id}    — O mesmo com um exame de exemplo
+  GET  /v1/analises/{job_id}        — 200 com o resultado (guardado por 1 h), 202 enquanto espera
+  Com a fila ativa, as rotas /v1/predict também passam por ela (mesma resposta de antes), e a API
+  não carrega as CNNs: quem roda as análises é o worker.
+
 Uso:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
@@ -47,25 +54,26 @@ Response JSON (Paridade Total com Script Base):
 import json
 import os
 import re
+import shutil
 import tempfile
+import time
+import uuid
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
-
-import numpy as np
-import tensorflow as tf
-from tensorflow_addons.metrics import F1Score
+from pathlib import Path
+from typing import Any, BinaryIO, Dict, List, Literal, Optional
 
 import asyncio
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from functools import partial
 
-# Importa o motor de inferência
-from engine import LOTE_CNN1, PESOS_ETAPAS, ExameInvalido, explicar_gradcam, run_pipeline
-from model_loader import ensure_amostras, ensure_models
+# Motor de inferência e fila. O TensorFlow só entra com as CNNs (modelos.py), e só sem a fila
+import fila
+from engine import ExameInvalido, run_pipeline
+from model_loader import ensure_amostras
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -76,14 +84,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("alzheimer-api")
 
-# ─────────────────────���───────────────────────────────────────────────────────
-# Caminhos dos modelos
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_ROI_PATH = os.getenv("MODEL_ROI_PATH", "models/modelo_cnn3_L20_3A5.h5")
-MODEL_CLF_PATH = os.getenv("MODEL_CLF_PATH", "models/CNN-4-2023-1.h5")
+# Modelos (caminhos em modelos.py) e fila
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Dicionário global — preenchido no startup
+# Dicionário global — preenchido no startup, quando a API mesma roda as análises (sem fila)
 MODELS: dict = {}
+
+# Conexão com o RabbitMQ — só com RABBITMQ_URL (fila.ATIVA)
+FILA: Optional[fila.FilaAnalises] = None
 
 # Exames de exemplo servidos pela API (pasta local, ignorada pelo git)
 AMOSTRAS_DIR = os.getenv("AMOSTRAS_DIR", "amostras")
@@ -310,50 +319,39 @@ class PredictionResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Carrega os dois modelos na memória global no startup.
-    
-    Os modelos ficam disponíveis durante toda a vida da aplicação.
+    """No startup: exames de exemplo e, conforme o modo, a fila ou as duas CNNs.
+
+    - Com RABBITMQ_URL: conecta na fila. As CNNs ficam com o worker (worker.py).
+    - Sem: carrega as CNNs aqui, e a API roda as análises direto, como antes da fila.
     """
-    ensure_models(MODEL_ROI_PATH, MODEL_CLF_PATH)
+    global FILA
     ensure_amostras(AMOSTRAS_DIR)
 
-    logger.info("Carregando modelo de ROI: %s", MODEL_ROI_PATH)
-    try:
-        MODELS["roi"] = tf.keras.models.load_model(MODEL_ROI_PATH)
-        logger.info("✓ Modelo ROI carregado com sucesso")
-    except Exception as e:
-        logger.error("✗ Erro ao carregar modelo ROI: %s", e)
-        raise
-
-    logger.info("Carregando modelo classificador: %s", MODEL_CLF_PATH)
-    try:
-        clf = tf.keras.models.load_model(MODEL_CLF_PATH, compile=False)
-        clf.compile(
-            optimizer="adam",
-            loss="binary_crossentropy",
-            metrics=[F1Score(num_classes=2, average="macro")],
-        )
-        MODELS["clf"] = clf
-        logger.info("✓ Modelo classificador carregado com sucesso")
-    except Exception as e:
-        logger.error("✗ Erro ao carregar modelo classificador: %s", e)
-        raise
-
-    # Aquecimento: compila os grafos com as mesmas formas de lote das requisições,
-    # para a primeira análise não pagar esse custo.
-    MODELS["roi"].predict_on_batch(np.zeros((LOTE_CNN1, 176, 176, 3), dtype=np.float32))
-    MODELS["clf"].predict_on_batch(np.zeros((19, 176, 176, 3), dtype=np.float32))
-    explicar_gradcam([np.zeros((176, 176), dtype=np.uint8)] * 19, MODELS["clf"], 0)
-    logger.info("✓ Modelos aquecidos (lotes de %d e 19, Grad-CAM)", LOTE_CNN1)
+    limpeza = None
+    if fila.ATIVA:
+        FILA = fila.FilaAnalises(manager.send_progress)
+        await FILA.iniciar()
+        limpeza = asyncio.create_task(fila.limpar_periodicamente())
+        pronto = "Fila de análises conectada (as CNNs rodam no worker)"
+    else:
+        # Import aqui: com a fila, o processo da API nem carrega o TensorFlow
+        from modelos import carregar_modelos
+        MODELS.update(carregar_modelos())
+        pronto = "Modelos carregados"
 
     logger.info("═" * 70)
-    logger.info("SERVIDOR PRONTO | Modelos carregados | Aguardando requisições")
+    logger.info("SERVIDOR PRONTO | %s | Aguardando requisições", pronto)
     logger.info("═" * 70)
 
     yield  # ← servidor ativo
 
+    if limpeza is not None:
+        limpeza.cancel()
+    if FILA is not None:
+        await FILA.fechar()
+        FILA = None
     MODELS.clear()
-    logger.info("Modelos liberados. Servidor encerrado.")
+    logger.info("Servidor encerrado.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -489,7 +487,14 @@ async def websocket_progress(websocket: WebSocket, job_id: str):
 
 @app.get("/healthz", tags=["infra"])
 async def health():
-    """Liveness probe."""
+    """Liveness probe.
+
+    Com a fila, `models_loaded` diz se há worker conectado (o worker só começa a consumir depois de
+    carregar as CNNs), e `fila` traz os workers e os exames esperando."""
+    if FILA is not None:
+        situacao = await FILA.situacao()
+        ok = situacao["workers"] > 0
+        return {"status": "ok" if ok else "degraded", "models_loaded": ok, "fila": situacao}
     ok = "roi" in MODELS and "clf" in MODELS
     return {
         "status": "ok" if ok else "degraded",
@@ -521,12 +526,8 @@ async def _analisar(caminho: str, job_id: Optional[str],
     def progress_callback(percent: float, message: str, **extra):
         if not job_id:
             return
-        # o engine informa o percentual da etapa; aqui vira progresso geral, sempre crescente
-        etapa = extra.get("stage")
-        base, peso = PESOS_ETAPAS.get(etapa, (0, 100))
         asyncio.run_coroutine_threadsafe(
-            manager.send_progress(job_id, {"progress": round(base + peso * percent / 100, 2),
-                                           "status": message, **extra}),
+            manager.send_progress(job_id, fila.evento_progresso(percent, message, **extra)),
             loop,
         )
 
@@ -558,6 +559,98 @@ def _erro_http(exc: Exception) -> HTTPException:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=f"Erro interno: {type(exc).__name__}: {exc}",
     )
+
+
+def _sufixo_nifti(nome: Optional[str]) -> str:
+    """.nii ou .nii.gz; outro formato vira 400."""
+    nome = nome or ""
+    if nome.endswith(".nii.gz"):
+        return ".nii.gz"
+    if nome.endswith(".nii"):
+        return ".nii"
+    # O nome do arquivo pode identificar o paciente: o log guarda só a extensão
+    logger.warning("Arquivo rejeitado: extensão inválida (%s)", os.path.splitext(nome)[1] or "sem extensão")
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Formato inválido. Envie um arquivo .nii ou .nii.gz.",
+    )
+
+
+def _gravar_upload(origem: BinaryIO, destino: Path) -> int:
+    """Copia o upload em blocos de 1 MB, sem carregar o arquivo inteiro na memória."""
+    with open(destino, "wb") as f:
+        shutil.copyfileobj(origem, f, length=1024 * 1024)
+    return destino.stat().st_size
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fila de análises (RabbitMQ): helpers das rotas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _exigir_fila() -> fila.FilaAnalises:
+    if FILA is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A fila de análises não está ativa neste servidor. Use /v1/predict/alzheimer.",
+        )
+    return FILA
+
+
+def _novo_job(job_id: Optional[str]) -> str:
+    """O job_id do cliente (que abre o SSE antes do envio) ou um novo. Repetido vira 409."""
+    _validar_job_id(job_id)
+    job = job_id or str(uuid.uuid4())
+    if _exigir_fila().conhecido(job):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Já existe uma análise com este job_id.")
+    return job
+
+
+async def _enfileirar(job_id: str, arquivo: Path, apagar: bool,
+                      visualizacao: bool, explicacao: bool) -> None:
+    pedido = {
+        "job_id": job_id,
+        "arquivo": str(arquivo),
+        "apagar_arquivo": apagar,  # exame enviado: sai depois da análise; amostra: fica
+        "visualizacao": visualizacao,
+        "explicacao": explicacao,
+        "enviado_em": time.time(),
+    }
+    try:
+        await _exigir_fila().enviar(pedido)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Falha ao publicar na fila: %s", exc)
+        if apagar:
+            arquivo.unlink(missing_ok=True)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="A fila de análises está indisponível. Tente de novo em instantes.")
+
+
+def _resposta_salva(salvo: Dict[str, Any]) -> PredictionResponse:
+    """Resultado gravado pelo worker: a resposta, ou o mesmo erro HTTP que a análise direta daria."""
+    corpo = salvo["corpo"]
+    if salvo["http_status"] != status.HTTP_200_OK:
+        raise HTTPException(status_code=salvo["http_status"], detail=corpo.get("detail", "Erro na análise."))
+    return PredictionResponse(**corpo)
+
+
+async def _pela_fila(job_id: str, arquivo: Path, apagar: bool,
+                     visualizacao: bool, explicacao: bool) -> PredictionResponse:
+    """Rotas /v1/predict com a fila ativa: põe o exame na fila e espera o worker terminar."""
+    fila_api = _exigir_fila()
+    fim = fila_api.esperar(job_id)
+    try:
+        await _enfileirar(job_id, arquivo, apagar, visualizacao, explicacao)
+        await fim
+    finally:
+        fila_api.parar_de_esperar(job_id)
+    salvo = await asyncio.to_thread(fila.ler_resultado, job_id)
+    if salvo is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="O resultado da análise não foi encontrado.")
+    return _resposta_salva(salvo)
 
 
 @app.post(
@@ -593,22 +686,18 @@ async def predict(
     - 503: Modelos não carregados
     - 500: Erro no pipeline
     """
-    fname = file.filename or ""
     _validar_job_id(job_id)
-    
-    # Validação 1: Extensão
-    if not (fname.endswith(".nii") or fname.endswith(".nii.gz")):
-        # O nome do arquivo pode identificar o paciente: o log guarda só a extensão
-        logger.warning("Arquivo rejeitado: extensão inválida (%s)", os.path.splitext(fname)[1] or "sem extensão")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Formato inválido. Envie um arquivo .nii ou .nii.gz.",
-        )
+    suffix = _sufixo_nifti(file.filename)
 
-    # Validação 2: Modelos
+    # Com a fila: o worker analisa, e esta rota espera o resultado (mesma resposta de antes)
+    if FILA is not None:
+        job = _novo_job(job_id)
+        destino = fila.caminho_entrada(job, suffix)
+        tamanho = await asyncio.to_thread(_gravar_upload, file.file, destino)
+        logger.info("Arquivo recebido: %s, %d bytes (fila)", suffix, tamanho)
+        return await _pela_fila(job, destino, True, visualizacao, explicacao)
+
     _exigir_modelos()
-
-    suffix = ".nii.gz" if fname.endswith(".nii.gz") else ".nii"
     tmp_path: str | None = None
 
     try:
@@ -713,9 +802,103 @@ async def predict_amostra(
     explicacao: bool = False,
 ):
     _validar_job_id(job_id)
-    _exigir_modelos()
     a = _amostra(amostra_id)
+    if FILA is not None:
+        return await _pela_fila(_novo_job(job_id), Path(_caminho_amostra(a["arquivo"])), False,
+                                visualizacao, explicacao)
+    _exigir_modelos()
     try:
         return await _analisar(_caminho_amostra(a["arquivo"]), job_id, visualizacao, explicacao)
     except Exception as exc:
         raise _erro_http(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fila de análises (RabbitMQ): envio assíncrono e resultado guardado
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AnaliseNaFila(BaseModel):
+    """Resposta 202: o exame está na fila ou em análise."""
+
+    job_id: str
+    estado: Literal["na_fila", "processando"]
+    posicao: Optional[int] = Field(None, description="Lugar na fila, contando os exames em análise")
+    resultado: str = Field(..., description="Onde buscar o resultado (GET)")
+
+
+def _aceita(job_id: str) -> JSONResponse:
+    """202 Accepted com o endereço do resultado (Location) e o intervalo sugerido para consultar."""
+    url = f"/v1/analises/{job_id}"
+    fila_api = _exigir_fila()
+    corpo = AnaliseNaFila(job_id=job_id, estado=fila_api.estado(job_id) or "processando",
+                          posicao=fila_api.posicao(job_id), resultado=url)
+    return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=corpo.model_dump(exclude_none=True),
+                        headers={"Location": url, "Retry-After": "3"})
+
+
+_DESCRICAO_FILA = (
+    "Responde 202 na hora, com a posição na fila. O progresso sai no SSE de mesmo `job_id` "
+    "(`queued` com a posição enquanto espera, `start` quando o worker pega o exame e `result` no "
+    "fim), e o resultado em `GET /v1/analises/{job_id}`. Só com a fila ativa (senão, 503)."
+)
+
+
+@app.post("/v1/analises", status_code=status.HTTP_202_ACCEPTED, response_model=AnaliseNaFila,
+          response_model_exclude_none=True, tags=["fila"], summary="Põe um exame enviado na fila",
+          description=_DESCRICAO_FILA)
+async def enfileirar_analise(
+    file: UploadFile = File(..., description="Arquivo NIfTI (.nii ou .nii.gz)"),
+    job_id: Optional[str] = Query(None, description="Escolhido pelo cliente para abrir o SSE antes do envio"),
+    visualizacao: bool = Query(True, description="Inclui as imagens que as CNNs receberam"),
+    explicacao: bool = Query(False, description="Inclui os mapas Grad-CAM da CNN2"),
+):
+    suffix = _sufixo_nifti(file.filename)
+    job = _novo_job(job_id)
+    destino = fila.caminho_entrada(job, suffix)
+    tamanho = await asyncio.to_thread(_gravar_upload, file.file, destino)
+    logger.info("Arquivo recebido para a fila: %s, %d bytes", suffix, tamanho)
+    await _enfileirar(job, destino, True, visualizacao, explicacao)
+    return _aceita(job)
+
+
+@app.post("/v1/analises/amostra/{amostra_id}", status_code=status.HTTP_202_ACCEPTED,
+          response_model=AnaliseNaFila, response_model_exclude_none=True, tags=["fila"],
+          summary="Põe um exame de exemplo na fila", description=_DESCRICAO_FILA)
+async def enfileirar_amostra(
+    amostra_id: str,
+    job_id: Optional[str] = Query(None, description="Escolhido pelo cliente para abrir o SSE antes do envio"),
+    visualizacao: bool = Query(True, description="Inclui as imagens que as CNNs receberam"),
+    explicacao: bool = Query(False, description="Inclui os mapas Grad-CAM da CNN2"),
+):
+    a = _amostra(amostra_id)
+    job = _novo_job(job_id)
+    await _enfileirar(job, Path(_caminho_amostra(a["arquivo"])), False, visualizacao, explicacao)
+    return _aceita(job)
+
+
+@app.get(
+    "/v1/analises/{job_id}",
+    response_model=PredictionResponse,
+    response_model_exclude_none=True,
+    responses={
+        202: {"model": AnaliseNaFila, "description": "Ainda na fila ou em análise"},
+        404: {"description": "Análise desconhecida ou resultado vencido"},
+    },
+    tags=["fila"],
+    summary="Resultado de uma análise da fila",
+)
+async def resultado_analise(job_id: str):
+    """200 com a mesma resposta de /v1/predict, guardada por `RESULTADO_TTL_S` (1 h). Se a análise
+    falhou, o mesmo erro HTTP que a análise direta daria (400 para exame inválido)."""
+    _validar_job_id(job_id)
+    fila_api = _exigir_fila()
+    salvo = await asyncio.to_thread(fila.ler_resultado, job_id)
+    if salvo is not None:
+        return _resposta_salva(salvo)
+    if fila_api.estado(job_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Análise não encontrada. O resultado fica guardado por {fila.RESULTADO_TTL_S // 60} "
+                   "minutos; envie o exame de novo.",
+        )
+    return _aceita(job_id)
